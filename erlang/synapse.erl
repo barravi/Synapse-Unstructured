@@ -1101,7 +1101,8 @@ searchListener(ExperimentCoordinator, StatDict, OnGoing, WorkerPID) ->
 							NewAlreadyFound = true
 						end
 				end,
-				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg+NumMsg, NewAlreadyFound}),
+%				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg+NumMsg, NewAlreadyFound}),
+				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg, NewAlreadyFound}),
 				NewStatDict = dict:store({Value, TTL, Iteration}, StatRec, StatDict)
 			% erase(ReqId)
 		end,

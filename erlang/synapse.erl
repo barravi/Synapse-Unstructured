@@ -24,7 +24,9 @@
 % 9 - Synapse sceglie vicini usando metodo con MAX-MESSAGES. DA FARE
 % 10- Implementa con high order functions OK
 %     (passa la funzione di probabilita', parametrizza in fase di compilazione) OK
-
+% 11- Implementa alpha multipli con la stessa query:
+%     Insertion si fa sempre, ma con valori diversi.
+%     Se imposto una ricerca per Value=0, allora dico di restituire TUTTE le risorse in possesso di ogni nodo.
 % 1.5 Gb di memoria per 1.000.000 di nodi semplici (erl +P 2000000)
 % 5> DNNV = synapse:insertValue(0.01, synapse:assignNeightbors(synapse:initNodeList(10000))).
 % 5> Res = synapse:searchCoordinatorVT(5, 10, 3, 3, 1, DNNV).
@@ -78,7 +80,7 @@
 
 -define(PARALLEL_REQUESTS, 1). % number of parallel processes requesting a key.
 
--record(stat, {value=0, ttl=0, iteration=0, sent=0, response=0, found=0, notFound=0, foundAfter=0, timeout=0, m=0, m2=0, pHit=0, numMessages=[]}).
+-record(stat, {value=0, ttl=0, iteration=0, sent=0, response=0, found=dict:new(), notFound=0, foundAfter=dict:new(), timeout=0, m=0, m2=0, pHit=0, numMessages=[]}).
 % found2, notFound2, timeout2, numMessages2 record all the results we get AFTER we receive the first one (used in flooding)
 
 %% ?LOG logs debug messages, these should disappear during the official simulation.
@@ -204,13 +206,23 @@ synapseNode(SynapseState) -> %% Id must be in the form "Node2"
 		Id = SynapseState#synapseState.nodeId,
 		Neightbors = SynapseState#synapseState.neightbors,
 %% If the node has the value, send a foundValue to the requester	
-		case get(Value) of 
-			undefined -> %Value not found
-				ValueFound = false;
-			_ ->
-				?LOGROUTE("Value " ++ integer_to_list(Value) ++ " found at node " ++ Id),
-				Originator ! {foundValue, Value, NumMessages, ReqId, Id, self()},
-				ValueFound = true
+		if Value == 0 ->
+			lists:map(fun({ValueD, _}) ->
+				?LOGROUTE("Value " ++ integer_to_list(ValueD) ++ " found at node " ++ Id),
+        case ValueD of
+					random_seed -> ignore;
+					_-> Originator ! {foundValue, ValueD, NumMessages, ReqId, Id, self()}
+				end
+			end, get());
+		true ->	
+			case get(Value) of 
+				undefined -> %Value not found
+					ValueFound = false;
+				_ ->
+					?LOGROUTE("Value " ++ integer_to_list(Value) ++ " found at node " ++ Id),
+					Originator ! {foundValue, Value, NumMessages, ReqId, Id, self()},
+					ValueFound = true
+			end
 		end,
 %% If there is still TTL, propagate the message
 		if TTL > 0 ->
@@ -966,11 +978,15 @@ saveToFile(OutputFile, StatDict) ->
 		NumMsgLen = length(NumMsgList),
 		NumMsgTot = lists:foldl(fun(NM, S) -> S+NM end, 0, NumMsgList),
 		M2 = StatRecord#stat.response/StatRecord#stat.sent,
-		NewStatRecord = StatRecord#stat{m=NumMsgTot/NumMsgLen, m2=M2, pHit=StatRecord#stat.found/StatRecord#stat.sent},
+		FoundList = dict:to_list(StatRecord#stat.found),
+		FoundAfterList = dict:to_list(StatRecord#stat.foundAfter),
+		PHitList = lists:map(fun({Alpha, NumFound}) ->
+			{Alpha, NumFound / StatRecord#stat.sent}
+		end, FoundList),
+		NewStatRecord = StatRecord#stat{m={m, NumMsgTot/NumMsgLen}, m2=M2, pHit={pHit, PHitList}, found=FoundList, foundAfter=FoundAfterList},
 		file:write_file(OutputFile, io_lib:fwrite("~p.\n", [NewStatRecord]), [append]),
 		NewStatRecord
-	end, StatDict)
-.
+	end, StatDict).
 
 %% Collect statistics from workers and listeners.
 collectStats(0, StatDict, NodeDict) -> 
@@ -988,8 +1004,12 @@ collectStats(NumRemainingStats, StatDict, NodeDict) ->
 			dict:merge(fun(_, RS1, RS2) ->
 				#stat{value = RS1#stat.value, ttl = RS1#stat.ttl, iteration = RS1#stat.iteration,
 					sent = RS1#stat.sent + RS2#stat.sent,
-			  	found = RS1#stat.found + RS2#stat.found,
-					foundAfter = RS1#stat.foundAfter + RS2#stat.foundAfter,
+			  	found = dict:merge(fun(_, F1, F2)->
+						F1+F2
+					end, RS1#stat.found, RS2#stat.found),
+					foundAfter = dict:merge(fun(_, FA1, FA2) ->
+						FA1+FA2
+					end, RS1#stat.foundAfter, RS2#stat.foundAfter),
 			  	notFound = RS1#stat.notFound + RS2#stat.notFound,
 			  	response = RS1#stat.response + RS2#stat.response,
 			  	timeout = RS1#stat.timeout + RS2#stat.timeout,
@@ -1067,7 +1087,8 @@ searchListener(ExperimentCoordinator, StatDict, OnGoing, WorkerPID) ->
 %% The worker is creating a new request, ask the lilstener to store 
 %% a record of it with all the parameters (Value, TTL, Iteration).
 	{newRequest, ReqId, Value, TTL, Iteration, From} ->
-		put(ReqId, {erlang:now(), Value, TTL, Iteration, 0, false}),
+		NewAlreadyFoundDict = dict:new(),
+		put(ReqId, {erlang:now(), Value, TTL, Iteration, 0, NewAlreadyFoundDict}), %{id,,,,NumMessages, AlreadyFound}
 		From ! {okGo, ReqId},
 		case dict:find({Value, TTL, Iteration}, StatDict) of
 			error -> 
@@ -1080,29 +1101,36 @@ searchListener(ExperimentCoordinator, StatDict, OnGoing, WorkerPID) ->
 		searchListener(ExperimentCoordinator, NewStatDict, onGoing, From);
 
 %% A search has completed the value has been found
-	{foundValue, Value, NumMsg, ReqId, Id, From} ->
+	{foundValue, ValueFound, NumMsg, ReqId, Id, From} ->
 		case Rec = get(ReqId) of
 			undefined -> 
 				?WARN(["FOUND Response without a ReqId. This shoudln't happen", ReqId]),
 				NewStatDict = StatDict;
-			_ ->	{_, Value, TTL, Iteration, PrevNumMsg, AlreadyFound} = Rec,
+			_ ->	{_, Value, TTL, Iteration, PrevNumMsg, AlreadyFoundDict} = Rec,
 				case dict:find({Value, TTL, Iteration}, StatDict) of
 					error -> 
-						StatRec = #stat{value=Value, ttl=TTL, iteration=Iteration, found=1},
-						NewAlreadyFound = true; 
+						StatRec = #stat{value=Value, ttl=TTL, iteration=Iteration, found=dict:store(ValueFound, 1, dict:new())},
+						NewAlreadyFoundDict = dict:store(ValueFound, true, AlreadyFoundDict); 
 					{ok, ExistingRec} ->
-						if AlreadyFound == true -> %if the value for this request has been already found, we ignore it for stats
-							PrevFoundAfter = ExistingRec#stat.foundAfter,
-							StatRec = ExistingRec#stat{foundAfter=PrevFoundAfter+1},
-							NewAlreadyFound = AlreadyFound;
-						true ->
-							PrevFound = ExistingRec#stat.found,
-							StatRec = ExistingRec#stat{found=PrevFound+1},
-							NewAlreadyFound = true
+						case dict:find(ValueFound, AlreadyFoundDict) of
+							{ok, true} -> %if the value for this request has been already found, we ignore it for stats
+								PrevFoundAfter = case dict:find(ValueFound, ExistingRec#stat.foundAfter) of
+									error -> 0;
+									{ok, Val} -> Val
+								end,
+								StatRec = ExistingRec#stat{foundAfter=dict:store(ValueFound,PrevFoundAfter+1,ExistingRec#stat.foundAfter)},
+								NewAlreadyFoundDict = AlreadyFoundDict;
+							error ->
+								PrevFound = case dict:find(ValueFound, ExistingRec#stat.found) of
+									error -> 0;
+									{ok, Val} -> Val
+								end,
+								StatRec = ExistingRec#stat{found=dict:store(ValueFound, PrevFound+1, ExistingRec#stat.found)},
+								NewAlreadyFoundDict = dict:store(ValueFound, true, AlreadyFoundDict)
 						end
 				end,
 %				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg+NumMsg, NewAlreadyFound}),
-				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg, NewAlreadyFound}),
+				put(ReqId, {erlang:now(), Value, TTL, Iteration, PrevNumMsg, NewAlreadyFoundDict}),
 				NewStatDict = dict:store({Value, TTL, Iteration}, StatRec, StatDict)
 			% erase(ReqId)
 		end,

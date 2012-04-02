@@ -65,6 +65,12 @@
 -define(DEFAULT_TTL, 3).
 -define(DEFAULT_QUERYINT_MILLIS, 50).
 
+-ifdef(no_propagation).
+-define(PROPAGATE_ON_FOUND, false).
+-else.
+-define(PROPAGATE_ON_FOUND, true).
+-endif.
+
 -define(B_DISPLAY_OUTPUT, 100000). %% every how many nodes to display a progress message.
 -define(B_NODES, 10000). %% Nodes to be created in parallel
 -define(DEFAULT_TIMEOUT, 10000).
@@ -213,19 +219,24 @@ synapseNode(SynapseState) -> %% Id must be in the form "Node2"
 					random_seed -> ignore;
 					_-> Originator ! {foundValue, ValueD, NumMessages, ReqId, Id, self()}
 				end
-			end, get());
+			end, get()),
+			ValueFound=true;
 		true ->	
 			case get(Value) of 
 				undefined -> %Value not found
 					ValueFound = false;
 				_ ->
 					?LOGROUTE("Value " ++ integer_to_list(Value) ++ " found at node " ++ Id),
+					%?MSG(["FOUND!", Value]),
 					Originator ! {foundValue, Value, NumMessages, ReqId, Id, self()},
 					ValueFound = true
 			end
 		end,
-%% If there is still TTL, propagate the message
-		if TTL > 0 ->
+		%?MSG(["ValueFound", ValueFound]),
+%% If there is still TTL, either propagate the message by default, or propagate it if 
+%% the resource has not been found.
+		if (?PROPAGATE_ON_FOUND or not ValueFound) and (TTL > 0) ->
+			%?MSG(["ValueFound, PROPAGATE, TTL", ValueFound, ?PROPAGATE_ON_FOUND, TTL]),
 			Dest = selectDestList(Neightbors, From),
 			case length(Dest) of
 				0 ->
@@ -237,13 +248,9 @@ synapseNode(SynapseState) -> %% Id must be in the form "Node2"
 			end;
 %% If no more TTL, we stop, and send a notFound message in case the node didn't find it
 		true -> 
-%			case ValueFound of
-%				false ->
-					?LOGROUTE("Query for value " ++ integer_to_list(Value) ++ " ended."),
-					Originator ! {endQuery, Value, NumMessages, ReqId, Id, self()} %;
-%				true ->
-%					ok
-%			end			
+%			?MSG(["STOP TTL ValueFound PROPAGATE",TTL,ValueFound,?PROPAGATE_ON_FOUND]),
+			?LOGROUTE("Query for value " ++ integer_to_list(Value) ++ " ended."),
+			Originator ! {endQuery, Value, NumMessages, ReqId, Id, self()} %;
 		end,			
 
 %% OLD IMPLEMENTATION
